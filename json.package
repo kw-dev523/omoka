@@ -1,0 +1,1090 @@
+{
+  "name": "omoka",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "node server/index.js",
+    "client": "cd client && npm run dev -- --host 0.0.0.0",
+    "build": "cd client && npm run build",
+    "start": "NODE_ENV=production node server/index.js",
+    "install:all": "npm install && cd client && npm install"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
+
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+const fs = require("fs");
+require("dotenv").config();
+
+const { readDb, writeDb, createId, slugify } = require("./utils");
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "omoka-dev-secret";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin@omoka123";
+
+function generateToken(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email, name: user.name, role: user.role },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+}
+
+function sanitizeUser(user) {
+  if (!user) return null;
+
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    balance: user.balance || 0,
+    totalEarned: user.totalEarned || 0,
+    referralCode: user.referralCode,
+    referredBy: user.referredBy || null,
+    watchedVideoIds: user.watchedVideoIds || [],
+    payoutRequests: user.payoutRequests || []
+  };
+}
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ message: "Invalid token" });
+  }
+}
+
+function adminMiddleware(req, res, next) {
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ message: "Admin access only" });
+  }
+  next();
+}
+
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
+app.use(express.json({ limit: "50mb" }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, message: "omoka API is running" });
+});
+
+// ===== AUTH ENDPOINTS =====
+
+app.post("/api/auth/register", async (req, res) => {
+  const { name, email, password, refCode } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: "Name, email, and password are required" });
+  }
+
+  const db = readDb();
+
+  const exists = db.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+  if (exists) {
+    return res.status(409).json({ message: "User already exists" });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const referralCode = slugify(`${name}-${Math.random().toString(36).slice(2, 8)}`);
+
+  const user = {
+    id: createId("user"),
+    name,
+    email: String(email).toLowerCase(),
+    passwordHash,
+    balance: 0,
+    totalEarned: 0,
+    referralCode,
+    referredBy: null,
+    watchedVideoIds: [],
+    payoutRequests: [],
+    role: "user",
+    createdAt: new Date().toISOString()
+  };
+
+  if (refCode) {
+    const referrer = db.users.find((u) => u.referralCode === refCode);
+    if (referrer) {
+      user.referredBy = referrer.id;
+      referrer.balance = Number(referrer.balance || 0) + 10;
+      referrer.totalEarned = Number(referrer.totalEarned || 0) + 10;
+      referrer.referralCount = Number(referrer.referralCount || 0) + 1;
+
+      db.transactions.push({
+        id: createId("tx"),
+        userId: referrer.id,
+        type: "referral_bonus",
+        amount: 10,
+        createdAt: new Date().toISOString()
+      });
+    }
+  }
+
+  db.users.push(user);
+  writeDb(db);
+
+  const token = generateToken(user);
+
+  return res.status(201).json({
+    token,
+    user: sanitizeUser(user)
+  });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password are required" });
+  }
+
+  const db = readDb();
+  const user = db.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+
+  if (!user) {
+    return res.status(401).json({ message: "Invalid credentials" });
+  }
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+
+  if (!valid) {
+    return res.status(401).json({ message: "Invalid credentials" });
+  }
+
+  const token = generateToken(user);
+
+  return res.json({
+    token,
+    user: sanitizeUser(user)
+  });
+});
+
+app.post("/api/auth/admin-login", async (req, res) => {
+  const { password } = req.body;
+
+  if (!password) {
+    return res.status(400).json({ message: "Password is required" });
+  }
+
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ message: "Invalid admin password" });
+  }
+
+  const adminUser = {
+    id: "admin_1",
+    email: "admin@omoka.local",
+    name: "Admin",
+    role: "admin"
+  };
+
+  const token = generateToken(adminUser);
+
+  return res.json({
+    token,
+    user: adminUser
+  });
+});
+
+// ===== USER ENDPOINTS =====
+
+app.get("/api/me", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  return res.json({ user: sanitizeUser(user) });
+});
+
+app.get("/api/dashboard", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const totalReferrals = db.users.filter((u) => u.referredBy === user.id).length;
+
+  return res.json({
+    stats: {
+      balance: user.balance || 0,
+      totalEarned: user.totalEarned || 0,
+      totalReferrals,
+      pendingPayouts: (user.payoutRequests || []).filter((p) => p.status === "pending").length,
+      videosWatched: (user.watchedVideoIds || []).length
+    },
+    user: sanitizeUser(user)
+  });
+});
+
+// ===== VIDEO ENDPOINTS =====
+
+app.get("/api/videos", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const watched = user.watchedVideoIds || [];
+
+  const videos = (db.videos || []).map((video) => ({
+    ...video,
+    watched: watched.includes(video.id)
+  }));
+
+  return res.json({ videos });
+});
+
+app.post("/api/videos/watch", authMiddleware, (req, res) => {
+  const { videoId } = req.body;
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const video = (db.videos || []).find((v) => v.id === videoId);
+
+  if (!video) {
+    return res.status(404).json({ message: "Video not found" });
+  }
+
+  if ((user.watchedVideoIds || []).includes(videoId)) {
+    return res.status(400).json({ message: "This video has already been watched" });
+  }
+
+  user.watchedVideoIds = user.watchedVideoIds || [];
+  user.watchedVideoIds.push(videoId);
+
+  user.balance = Number(user.balance || 0) + 20;
+  user.totalEarned = Number(user.totalEarned || 0) + 20;
+
+  db.transactions.push({
+    id: createId("tx"),
+    userId: user.id,
+    type: "video_reward",
+    amount: 20,
+    videoId: video.id,
+    createdAt: new Date().toISOString()
+  });
+
+  writeDb(db);
+
+  return res.json({
+    message: "Video watched successfully",
+    reward: 20,
+    balance: user.balance
+  });
+});
+
+// ===== REFERRAL ENDPOINTS =====
+
+app.get("/api/referrals", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const referredUsers = db.users.filter((u) => u.referredBy === user.id);
+
+  return res.json({
+    referralCode: user.referralCode,
+    referralLink: `${process.env.CLIENT_URL || "http://localhost:5173"}?ref=${user.referralCode}`,
+    referralCount: referredUsers.length,
+    referredUsers: referredUsers.map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email
+    }))
+  });
+});
+
+app.post("/api/referrals/apply", authMiddleware, (req, res) => {
+  const { referralCode } = req.body;
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  if (!referralCode) {
+    return res.status(400).json({ message: "Referral code is required" });
+  }
+
+  if (user.referredBy) {
+    return res.status(400).json({ message: "You have already used a referral code" });
+  }
+
+  const referrer = db.users.find((u) => u.referralCode === referralCode);
+  if (!referrer || referrer.id === user.id) {
+    return res.status(400).json({ message: "Invalid referral code" });
+  }
+
+  user.referredBy = referrer.id;
+  referrer.balance = Number(referrer.balance || 0) + 10;
+  referrer.totalEarned = Number(referrer.totalEarned || 0) + 10;
+  referrer.referralCount = Number(referrer.referralCount || 0) + 1;
+
+  db.transactions.push({
+    id: createId("tx"),
+    userId: referrer.id,
+    type: "referral_bonus",
+    amount: 10,
+    createdAt: new Date().toISOString()
+  });
+
+  writeDb(db);
+
+  return res.json({
+    message: "Referral applied successfully",
+    referrerName: referrer.name
+  });
+});
+
+// ===== PAYOUT ENDPOINTS =====
+
+app.post("/api/payouts/request", authMiddleware, (req, res) => {
+  const { amount, method, phoneNumber } = req.body;
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const payoutAmount = Number(amount);
+
+  if (!payoutAmount || payoutAmount < 200) {
+    return res.status(400).json({ message: "Minimum payout is KES 200" });
+  }
+
+  if ((user.balance || 0) < payoutAmount) {
+    return res.status(400).json({ message: "Insufficient balance" });
+  }
+
+  if (!phoneNumber || phoneNumber.trim() === "") {
+    return res.status(400).json({ message: "Phone number is required" });
+  }
+
+  const request = {
+    id: createId("payout"),
+    userId: user.id,
+    userName: user.name,
+    userEmail: user.email,
+    amount: payoutAmount,
+    method: method || "Mobile Money",
+    userPhoneNumber: phoneNumber,
+    recipientPhone: "0705275212",
+    status: "pending",
+    createdAt: new Date().toISOString()
+  };
+
+  user.balance = Number(user.balance || 0) - payoutAmount;
+  user.payoutRequests = user.payoutRequests || [];
+  user.payoutRequests.unshift(request);
+
+  db.payouts.push(request);
+  db.transactions.push({
+    id: createId("tx"),
+    userId: user.id,
+    type: "payout_request",
+    amount: -payoutAmount,
+    phoneNumber: phoneNumber,
+    createdAt: new Date().toISOString()
+  });
+
+  writeDb(db);
+
+  return res.json({
+    message: `Payout of KES ${payoutAmount} will be sent to 0705275212`,
+    request
+  });
+});
+
+app.get("/api/payouts", authMiddleware, adminMiddleware, (req, res) => {
+  const db = readDb();
+  return res.json({ payouts: db.payouts || [] });
+});
+
+app.patch("/api/payouts/:id", authMiddleware, adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  const db = readDb();
+
+  const payout = db.payouts.find((p) => p.id === id);
+  if (!payout) {
+    return res.status(404).json({ message: "Payout not found" });
+  }
+
+  payout.status = status;
+  payout.updatedAt = new Date().toISOString();
+
+  writeDb(db);
+
+  return res.json({ message: "Payout updated", payout });
+});
+
+// ===== ADMIN VIDEO ENDPOINTS =====
+
+app.post("/api/admin/videos", authMiddleware, adminMiddleware, (req, res) => {
+  const { title, duration, src, description } = req.body;
+
+  if (!title || !src) {
+    return res.status(400).json({ message: "Title and video source are required" });
+  }
+
+  const db = readDb();
+  db.videos = db.videos || [];
+
+  const video = {
+    id: createId("video"),
+    title,
+    duration: duration || "2:00",
+    src,
+    description: description || "",
+    reward: 20,
+    createdAt: new Date().toISOString()
+  };
+
+  db.videos.push(video);
+  writeDb(db);
+
+  return res.status(201).json({
+    message: "Video uploaded successfully",
+    video
+  });
+});
+
+app.get("/api/admin/videos", authMiddleware, adminMiddleware, (req, res) => {
+  const db = readDb();
+  return res.json({ videos: db.videos || [] });
+});
+
+app.delete("/api/admin/videos/:id", authMiddleware, adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+
+  const index = (db.videos || []).findIndex((v) => v.id === id);
+  if (index === -1) {
+    return res.status(404).json({ message: "Video not found" });
+  }
+
+  db.videos.splice(index, 1);
+  writeDb(db);
+
+  return res.json({ message: "Video deleted" });
+});
+
+app.get("/api/admin/dashboard", authMiddleware, adminMiddleware, (req, res) => {
+  const db = readDb();
+
+  const totalUsers = db.users.length;
+  const totalEarnings = db.users.reduce((sum, u) => sum + (u.totalEarned || 0), 0);
+  const pendingPayouts = (db.payouts || []).filter((p) => p.status === "pending").length;
+  const totalPayouts = (db.payouts || []).reduce((sum, p) => sum + (p.amount || 0), 0);
+  const totalVideos = (db.videos || []).length;
+
+  return res.json({
+    stats: {
+      totalUsers,
+      totalEarnings,
+      pendingPayouts,
+      totalPayouts,
+      totalVideos
+    },
+    recentPayouts: (db.payouts || []).slice(0, 10),
+    recentUsers: db.users.slice(-10).reverse()
+  });
+});
+
+app.use(express.static(path.join(__dirname, "../client/dist")));
+
+app.get("*", (req, res) => {
+  const indexFile = path.join(__dirname, "../client/dist/index.html");
+
+  if (fs.existsSync(indexFile)) {
+    return res.sendFile(indexFile);
+  }
+
+  res.send(`
+    <html>
+      <head>
+        <title>omoka</title>
+      </head>
+      <body>
+        <p>omoka backend is running. Start the frontend with Vite.</p>
+      </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, () => {
+  console.log(`omoka backend is running on http://localhost:${PORT}`);
+});const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+const fs = require("fs");
+require("dotenv").config();
+
+const { readDb, writeDb, createId, slugify } = require("./utils");
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "omoka-dev-secret";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin@omoka123";
+
+function generateToken(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email, name: user.name, role: user.role },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+}
+
+function sanitizeUser(user) {
+  if (!user) return null;
+
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    balance: user.balance || 0,
+    totalEarned: user.totalEarned || 0,
+    referralCode: user.referralCode,
+    referredBy: user.referredBy || null,
+    watchedVideoIds: user.watchedVideoIds || [],
+    payoutRequests: user.payoutRequests || []
+  };
+}
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ message: "Invalid token" });
+  }
+}
+
+function adminMiddleware(req, res, next) {
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ message: "Admin access only" });
+  }
+  next();
+}
+
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
+app.use(express.json({ limit: "50mb" }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, message: "omoka API is running" });
+});
+
+// ===== AUTH ENDPOINTS =====
+
+app.post("/api/auth/register", async (req, res) => {
+  const { name, email, password, refCode } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: "Name, email, and password are required" });
+  }
+
+  const db = readDb();
+
+  const exists = db.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+  if (exists) {
+    return res.status(409).json({ message: "User already exists" });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const referralCode = slugify(`${name}-${Math.random().toString(36).slice(2, 8)}`);
+
+  const user = {
+    id: createId("user"),
+    name,
+    email: String(email).toLowerCase(),
+    passwordHash,
+    balance: 0,
+    totalEarned: 0,
+    referralCode,
+    referredBy: null,
+    watchedVideoIds: [],
+    payoutRequests: [],
+    role: "user",
+    createdAt: new Date().toISOString()
+  };
+
+  if (refCode) {
+    const referrer = db.users.find((u) => u.referralCode === refCode);
+    if (referrer) {
+      user.referredBy = referrer.id;
+      referrer.balance = Number(referrer.balance || 0) + 10;
+      referrer.totalEarned = Number(referrer.totalEarned || 0) + 10;
+      referrer.referralCount = Number(referrer.referralCount || 0) + 1;
+
+      db.transactions.push({
+        id: createId("tx"),
+        userId: referrer.id,
+        type: "referral_bonus",
+        amount: 10,
+        createdAt: new Date().toISOString()
+      });
+    }
+  }
+
+  db.users.push(user);
+  writeDb(db);
+
+  const token = generateToken(user);
+
+  return res.status(201).json({
+    token,
+    user: sanitizeUser(user)
+  });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password are required" });
+  }
+
+  const db = readDb();
+  const user = db.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+
+  if (!user) {
+    return res.status(401).json({ message: "Invalid credentials" });
+  }
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+
+  if (!valid) {
+    return res.status(401).json({ message: "Invalid credentials" });
+  }
+
+  const token = generateToken(user);
+
+  return res.json({
+    token,
+    user: sanitizeUser(user)
+  });
+});
+
+app.post("/api/auth/admin-login", async (req, res) => {
+  const { password } = req.body;
+
+  if (!password) {
+    return res.status(400).json({ message: "Password is required" });
+  }
+
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ message: "Invalid admin password" });
+  }
+
+  const adminUser = {
+    id: "admin_1",
+    email: "admin@omoka.local",
+    name: "Admin",
+    role: "admin"
+  };
+
+  const token = generateToken(adminUser);
+
+  return res.json({
+    token,
+    user: adminUser
+  });
+});
+
+// ===== USER ENDPOINTS =====
+
+app.get("/api/me", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  return res.json({ user: sanitizeUser(user) });
+});
+
+app.get("/api/dashboard", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const totalReferrals = db.users.filter((u) => u.referredBy === user.id).length;
+
+  return res.json({
+    stats: {
+      balance: user.balance || 0,
+      totalEarned: user.totalEarned || 0,
+      totalReferrals,
+      pendingPayouts: (user.payoutRequests || []).filter((p) => p.status === "pending").length,
+      videosWatched: (user.watchedVideoIds || []).length
+    },
+    user: sanitizeUser(user)
+  });
+});
+
+// ===== VIDEO ENDPOINTS =====
+
+app.get("/api/videos", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const watched = user.watchedVideoIds || [];
+
+  const videos = (db.videos || []).map((video) => ({
+    ...video,
+    watched: watched.includes(video.id)
+  }));
+
+  return res.json({ videos });
+});
+
+app.post("/api/videos/watch", authMiddleware, (req, res) => {
+  const { videoId } = req.body;
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const video = (db.videos || []).find((v) => v.id === videoId);
+
+  if (!video) {
+    return res.status(404).json({ message: "Video not found" });
+  }
+
+  if ((user.watchedVideoIds || []).includes(videoId)) {
+    return res.status(400).json({ message: "This video has already been watched" });
+  }
+
+  user.watchedVideoIds = user.watchedVideoIds || [];
+  user.watchedVideoIds.push(videoId);
+
+  user.balance = Number(user.balance || 0) + 20;
+  user.totalEarned = Number(user.totalEarned || 0) + 20;
+
+  db.transactions.push({
+    id: createId("tx"),
+    userId: user.id,
+    type: "video_reward",
+    amount: 20,
+    videoId: video.id,
+    createdAt: new Date().toISOString()
+  });
+
+  writeDb(db);
+
+  return res.json({
+    message: "Video watched successfully",
+    reward: 20,
+    balance: user.balance
+  });
+});
+
+// ===== REFERRAL ENDPOINTS =====
+
+app.get("/api/referrals", authMiddleware, (req, res) => {
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const referredUsers = db.users.filter((u) => u.referredBy === user.id);
+
+  return res.json({
+    referralCode: user.referralCode,
+    referralLink: `${process.env.CLIENT_URL || "http://localhost:5173"}?ref=${user.referralCode}`,
+    referralCount: referredUsers.length,
+    referredUsers: referredUsers.map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email
+    }))
+  });
+});
+
+app.post("/api/referrals/apply", authMiddleware, (req, res) => {
+  const { referralCode } = req.body;
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  if (!referralCode) {
+    return res.status(400).json({ message: "Referral code is required" });
+  }
+
+  if (user.referredBy) {
+    return res.status(400).json({ message: "You have already used a referral code" });
+  }
+
+  const referrer = db.users.find((u) => u.referralCode === referralCode);
+  if (!referrer || referrer.id === user.id) {
+    return res.status(400).json({ message: "Invalid referral code" });
+  }
+
+  user.referredBy = referrer.id;
+  referrer.balance = Number(referrer.balance || 0) + 10;
+  referrer.totalEarned = Number(referrer.totalEarned || 0) + 10;
+  referrer.referralCount = Number(referrer.referralCount || 0) + 1;
+
+  db.transactions.push({
+    id: createId("tx"),
+    userId: referrer.id,
+    type: "referral_bonus",
+    amount: 10,
+    createdAt: new Date().toISOString()
+  });
+
+  writeDb(db);
+
+  return res.json({
+    message: "Referral applied successfully",
+    referrerName: referrer.name
+  });
+});
+
+// ===== PAYOUT ENDPOINTS =====
+
+app.post("/api/payouts/request", authMiddleware, (req, res) => {
+  const { amount, method, phoneNumber } = req.body;
+  const db = readDb();
+  const user = db.users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  const payoutAmount = Number(amount);
+
+  if (!payoutAmount || payoutAmount < 200) {
+    return res.status(400).json({ message: "Minimum payout is KES 200" });
+  }
+
+  if ((user.balance || 0) < payoutAmount) {
+    return res.status(400).json({ message: "Insufficient balance" });
+  }
+
+  if (!phoneNumber || phoneNumber.trim() === "") {
+    return res.status(400).json({ message: "Phone number is required" });
+  }
+
+  const request = {
+    id: createId("payout"),
+    userId: user.id,
+    userName: user.name,
+    userEmail: user.email,
+    amount: payoutAmount,
+    method: method || "Mobile Money",
+    userPhoneNumber: phoneNumber,
+    recipientPhone: "0705275212",
+    status: "pending",
+    createdAt: new Date().toISOString()
+  };
+
+  user.balance = Number(user.balance || 0) - payoutAmount;
+  user.payoutRequests = user.payoutRequests || [];
+  user.payoutRequests.unshift(request);
+
+  db.payouts.push(request);
+  db.transactions.push({
+    id: createId("tx"),
+    userId: user.id,
+    type: "payout_request",
+    amount: -payoutAmount,
+    phoneNumber: phoneNumber,
+    createdAt: new Date().toISOString()
+  });
+
+  writeDb(db);
+
+  return res.json({
+    message: `Payout of KES ${payoutAmount} will be sent to 0705275212`,
+    request
+  });
+});
+
+app.get("/api/payouts", authMiddleware, adminMiddleware, (req, res) => {
+  const db = readDb();
+  return res.json({ payouts: db.payouts || [] });
+});
+
+app.patch("/api/payouts/:id", authMiddleware, adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  const db = readDb();
+
+  const payout = db.payouts.find((p) => p.id === id);
+  if (!payout) {
+    return res.status(404).json({ message: "Payout not found" });
+  }
+
+  payout.status = status;
+  payout.updatedAt = new Date().toISOString();
+
+  writeDb(db);
+
+  return res.json({ message: "Payout updated", payout });
+});
+
+// ===== ADMIN VIDEO ENDPOINTS =====
+
+app.post("/api/admin/videos", authMiddleware, adminMiddleware, (req, res) => {
+  const { title, duration, src, description } = req.body;
+
+  if (!title || !src) {
+    return res.status(400).json({ message: "Title and video source are required" });
+  }
+
+  const db = readDb();
+  db.videos = db.videos || [];
+
+  const video = {
+    id: createId("video"),
+    title,
+    duration: duration || "2:00",
+    src,
+    description: description || "",
+    reward: 20,
+    createdAt: new Date().toISOString()
+  };
+
+  db.videos.push(video);
+  writeDb(db);
+
+  return res.status(201).json({
+    message: "Video uploaded successfully",
+    video
+  });
+});
+
+app.get("/api/admin/videos", authMiddleware, adminMiddleware, (req, res) => {
+  const db = readDb();
+  return res.json({ videos: db.videos || [] });
+});
+
+app.delete("/api/admin/videos/:id", authMiddleware, adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+
+  const index = (db.videos || []).findIndex((v) => v.id === id);
+  if (index === -1) {
+    return res.status(404).json({ message: "Video not found" });
+  }
+
+  db.videos.splice(index, 1);
+  writeDb(db);
+
+  return res.json({ message: "Video deleted" });
+});
+
+app.get("/api/admin/dashboard", authMiddleware, adminMiddleware, (req, res) => {
+  const db = readDb();
+
+  const totalUsers = db.users.length;
+  const totalEarnings = db.users.reduce((sum, u) => sum + (u.totalEarned || 0), 0);
+  const pendingPayouts = (db.payouts || []).filter((p) => p.status === "pending").length;
+  const totalPayouts = (db.payouts || []).reduce((sum, p) => sum + (p.amount || 0), 0);
+  const totalVideos = (db.videos || []).length;
+
+  return res.json({
+    stats: {
+      totalUsers,
+      totalEarnings,
+      pendingPayouts,
+      totalPayouts,
+      totalVideos
+    },
+    recentPayouts: (db.payouts || []).slice(0, 10),
+    recentUsers: db.users.slice(-10).reverse()
+  });
+});
+
+app.use(express.static(path.join(__dirname, "../client/dist")));
+
+app.get("*", (req, res) => {
+  const indexFile = path.join(__dirname, "../client/dist/index.html");
+
+  if (fs.existsSync(indexFile)) {
+    return res.sendFile(indexFile);
+  }
+
+  res.send(`
+    <html>
+      <head>
+        <title>omoka</title>
+      </head>
+      <body>
+        <p>omoka backend is running. Start the frontend with Vite.</p>
+      </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, () => {
+  console.log(`omoka backend is running on http://localhost:${PORT}`);
+});
